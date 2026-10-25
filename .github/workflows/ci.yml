@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff mypy
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test-client:
+    # SMA Bluetooth protocol client + repo guard tests; no homeassistant.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[test]"
+      - run: pytest tests --ignore=tests/ha -v
+
+  test-ha:
+    # Full integration tests against the HA test harness. HA >= 2026.3 (our
+    # minimum, see hacs.json) needs Python 3.14; on 3.13 pip resolves 2026.2.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -e ".[test,test-ha]"
+      - run: pytest tests/ha -v
+
+  hacs:
+    # The HACS action only validates public repositories.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+          # HACS requires an OSI-approved licence. This repo must stay
+          # CC BY-NC-SA 3.0 (derived from SBFspot), which is not OSI-approved,
+          # so the check can never pass. It only gates the HACS default
+          # catalog; installing as a custom repository is unaffected.
+          ignore: license
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  esphome:
+    # Compiles the ESP32 bridge firmware (esphome/sma-bt-bridge.yaml).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/cache@v4
+        with:
+          # ~/.cache/esphome: ESP-IDF framework + toolchain downloaded by
+          # `esphome compile`; ~/.platformio: same for PlatformIO based
+          # ESPHome releases; esphome/.esphome: incremental build output.
+          path: |
+            ~/.cache/esphome
+            ~/.platformio
+            esphome/.esphome
+          key: esphome-${{ runner.os }}-${{ hashFiles('esphome/sma-bt-bridge.yaml', 'esphome/components/**') }}
+          restore-keys: |
+            esphome-${{ runner.os }}-
+      - run: pip install esphome
+      - run: cp esphome/secrets.example.yaml esphome/secrets.yaml
+      - run: esphome compile esphome/sma-bt-bridge.yaml
+
+  bridge-protocol:
+    # Host tests of the bridge firmware: unit tests of the handshake / session
+    # state machine (pure C++17), then the real component code run against a
+    # fake Bluedroid and driven over TCP (esphome/tests/sim), plain and under
+    # ASan + UBSan.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: g++ -std=c++17 -Wall -Wextra -Werror -o "$RUNNER_TEMP/test_bridge_protocol" esphome/tests/test_bridge_protocol.cpp
+      - run: "$RUNNER_TEMP/test_bridge_protocol"
+      - run: bash esphome/tests/sim/run.sh

@@ -1,0 +1,108 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to your SMA inverter",
+        "description": "Enter the address of the ESP32 Bluetooth bridge and the Bluetooth address of the inverter. The inverter's Bluetooth radio sleeps when there is no sun, so set up in daylight.",
+        "data": {
+          "host": "Bridge host",
+          "port": "Bridge port",
+          "bt_address": "Inverter Bluetooth address",
+          "password": "Inverter password"
+        },
+        "data_description": {
+          "host": "Host name or IP address of the ESP32 that runs the SMA Bluetooth bridge firmware.",
+          "port": "TCP port of the bridge. The default is 9900.",
+          "bt_address": "Bluetooth address of the inverter, for example 00:80:25:AA:BB:CC.",
+          "password": "The inverter's user password. The SMA default is 0000."
+        }
+      },
+      "reconfigure": {
+        "title": "Change the bridge or the inverter address",
+        "description": "Change where the bridge and the inverter are. The settings are checked against the same inverter, so do this in daylight.",
+        "data": {
+          "host": "Bridge host",
+          "port": "Bridge port",
+          "bt_address": "Inverter Bluetooth address"
+        },
+        "data_description": {
+          "host": "Host name or IP address of the ESP32 that runs the SMA Bluetooth bridge firmware.",
+          "port": "TCP port of the bridge. The default is 9900.",
+          "bt_address": "Bluetooth address of the inverter, for example 00:80:25:AA:BB:CC."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Enter the inverter password again",
+        "description": "{name} rejected the password. Enter the correct user password. The inverter's Bluetooth radio sleeps when there is no sun, so do this in daylight.",
+        "data": {
+          "password": "Inverter password"
+        },
+        "data_description": {
+          "password": "The inverter's user password. The SMA default is 0000."
+        }
+      }
+    },
+    "error": {
+      "bridge_unreachable": "Cannot connect to the bridge. Check the host and port and that the ESP32 is on the network.",
+      "bridge_busy": "The bridge is busy with another connection. Try again in a minute.",
+      "inverter_unreachable": "The bridge cannot reach the inverter over Bluetooth. The inverter's Bluetooth radio sleeps when there is no sun, so try again in daylight and check the Bluetooth address.",
+      "cannot_connect": "The connection to the inverter failed. Try again.",
+      "invalid_auth": "The inverter rejected the password.",
+      "protocol_error": "The bridge or the inverter sent data that this integration does not understand.",
+      "invalid_bt_address": "This is not a Bluetooth address. Use the form 00:80:25:AA:BB:CC.",
+      "unknown": "Unexpected error. Check the Home Assistant log."
+    },
+    "abort": {
+      "already_configured": "This inverter is already configured.",
+      "reconfigure_successful": "The settings were changed.",
+      "reauth_successful": "The password was changed.",
+      "wrong_device": "This is a different inverter than the one that was set up. Add it as a new device instead."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "SBFspot options",
+        "description": "The inverter is only read while the sun is up (from 15 minutes before sunrise to 15 minutes after sunset).",
+        "data": {
+          "scan_interval": "Update interval"
+        },
+        "data_description": {
+          "scan_interval": "Seconds between two readings of the inverter. Minimum 30, maximum 3600."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "power": { "name": "AC power" },
+      "ac_power_l1": { "name": "AC power L1" },
+      "ac_power_l2": { "name": "AC power L2" },
+      "ac_power_l3": { "name": "AC power L3" },
+      "ac_voltage_l1": { "name": "AC voltage L1" },
+      "ac_voltage_l2": { "name": "AC voltage L2" },
+      "ac_voltage_l3": { "name": "AC voltage L3" },
+      "ac_current_l1": { "name": "AC current L1" },
+      "ac_current_l2": { "name": "AC current L2" },
+      "ac_current_l3": { "name": "AC current L3" },
+      "dc_power_a": { "name": "DC power string A" },
+      "dc_power_b": { "name": "DC power string B" },
+      "dc_voltage_a": { "name": "DC voltage string A" },
+      "dc_voltage_b": { "name": "DC voltage string B" },
+      "dc_current_a": { "name": "DC current string A" },
+      "dc_current_b": { "name": "DC current string B" },
+      "grid_frequency": { "name": "Grid frequency" },
+      "energy_today": { "name": "Energy today" },
+      "energy_total": { "name": "Energy total" },
+      "operating_time": { "name": "Operating time" },
+      "feed_in_time": { "name": "Feed-in time" },
+      "temperature": { "name": "Temperature" },
+      "status": { "name": "Status" },
+      "grid_relay": { "name": "Grid relay" },
+      "bluetooth_signal": { "name": "Bluetooth signal" }
+    },
+    "binary_sensor": {
+      "inverter_online": { "name": "Inverter online" }
+    }
+  }
+}

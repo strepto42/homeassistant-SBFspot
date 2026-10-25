@@ -1,0 +1,57 @@
+[project]
+name = "homeassistant-sbfspot"
+version = "0.1.0"
+description = "Home Assistant integration for SMA Bluetooth inverters (SBFspot protocol) via an ESP32 Bluetooth Classic bridge."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "CC-BY-NC-SA-3.0" }
+authors = [{ name = "Mark Cocquio" }]
+# The SMA Bluetooth client (smabt) uses only the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Protocol-client + repo guard tests run anywhere (incl. Windows).
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+# Full HA integration tests. Installs `homeassistant`, which is Linux/macOS
+# oriented (uvloop etc.) — run these in CI or WSL, not native Windows.
+test-ha = ["pytest-homeassistant-custom-component>=0.13"]
+dev = ["ruff>=0.6", "mypy>=1.11", "pillow>=10"]
+
+[project.urls]
+Homepage = "https://github.com/strepto42/homeassistant-SBFspot"
+Issues = "https://github.com/strepto42/homeassistant-SBFspot/issues"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# This repo is a Home Assistant custom integration, not a distributable
+# package. Declaring no modules keeps `pip install -e .` to metadata + deps
+# only and avoids setuptools flat-layout auto-discovery (which otherwise
+# generates a broken editable finder over custom_components/ and tests/).
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Put the repo root on sys.path so `custom_components.sbfspot` imports
+# without an editable install of this project.
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+extend-exclude = ["esphome/.esphome"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["custom_components"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true

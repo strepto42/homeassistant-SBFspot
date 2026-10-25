@@ -1,0 +1,57 @@
+# Example ESPHome device config for the SMA Bluetooth bridge.
+#
+# Flash this to an ORIGINAL ESP32 (ESP32-WROOM / ESP32-WROVER, e.g. a
+# "ESP32 DevKit V1"). Only that chip has Bluetooth Classic; the S2, S3, C3,
+# C6 and H2 variants cannot talk to an SMA inverter.
+#
+# The firmware is a generic TCP <-> Bluetooth SPP pipe. It contains no
+# inverter specific settings: Home Assistant tells it which Bluetooth address
+# to connect to for every session.
+#
+#   cp secrets.example.yaml secrets.yaml   # then edit secrets.yaml
+#   esphome run sma-bt-bridge.yaml
+
+esphome:
+  name: sma-bt-bridge
+  friendly_name: SMA Bluetooth Bridge
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sma_bt_bridge]
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    # Bare `encryption:` authenticates uploads with the API encryption key
+    # above, so there is no separate OTA password to manage.
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # WiFi and Bluetooth share the ESP32's radio. With WiFi power saving on, the
+  # radio is handed back and forth too often for a steady SPP link.
+  power_save_mode: none
+
+sma_bt_bridge:
+  # TCP port Home Assistant connects to.
+  port: 9900
+  # Give up on the Bluetooth connection to the inverter after this long.
+  bt_connect_timeout: 15s
+  # Close a session when nothing was transferred in either direction.
+  idle_timeout: 60s
+  # Legacy pairing PIN of the inverter (SMA default for the "user" group is
+  # 0000). Keep the quotes: unquoted, YAML would turn it into a number.
+  pin: "0000"
