@@ -156,3 +156,6 @@ a release). The user pushes tags.
 
 CC BY-NC-SA 3.0, inherited from SBFspot (ShareAlike). Keep SBFspot credited in
 `LICENSE`, the README and the `smabt` docstrings. No commercial use.
+HACS requires an OSI-approved licence for its default catalog, so this repo
+can only be installed as a HACS *custom repository*; CI skips the HACS
+`license` check for that reason. Do not "fix" it by changing the licence.
