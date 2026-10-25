@@ -50,6 +50,11 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
+          # HACS requires an OSI-approved licence. This repo must stay
+          # CC BY-NC-SA 3.0 (derived from SBFspot), which is not OSI-approved,
+          # so the check can never pass. It only gates the HACS default
+          # catalog; installing as a custom repository is unaffected.
+          ignore: license
 
   hassfest:
     runs-on: ubuntu-latest
