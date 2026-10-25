@@ -41,6 +41,8 @@ jobs:
       - run: pytest tests/ha -v
 
   hacs:
+    # The HACS action only validates public repositories.
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
