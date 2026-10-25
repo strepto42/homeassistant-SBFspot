@@ -25,16 +25,29 @@ use Bluetooth Classic (RFCOMM).
 
 ## 1. Flash the bridge
 
-1. Copy `esphome/components/sma_bt_bridge/` to your ESPHome config folder
-   (`/config/esphome/components/sma_bt_bridge/` with the ESPHome add-on).
-2. Copy `esphome/sma-bt-bridge.yaml` there and add `wifi_ssid`,
-   `wifi_password` and `api_encryption_key` to your ESPHome `secrets.yaml`.
-3. Install it to the ESP32 from the ESPHome dashboard. ESPHome 2026.10 or later
-   is required.
+1. In the ESPHome dashboard, make a new device from
+   [`esphome/sma-bt-bridge.yaml`](esphome/sma-bt-bridge.yaml). Replace its
+   `external_components:` block with this one, so ESPHome fetches the
+   component from GitHub:
 
-When this repository is public you can instead use
-`external_components: - source: github://strepto42/homeassistant-SBFspot@main`
-with `components: [sma_bt_bridge]` and the path `esphome/components`.
+   ```yaml
+   external_components:
+     - source:
+         type: git
+         url: https://github.com/strepto42/homeassistant-SBFspot
+         ref: main
+         path: esphome/components
+       components: [sma_bt_bridge]
+   ```
+
+2. Add `wifi_ssid`, `wifi_password` and `api_encryption_key` to your ESPHome
+   `secrets.yaml`.
+3. Install it to the ESP32. The first install must be over USB. ESPHome
+   2026.10 or later is required.
+
+From a clone of this repository you can also flash it directly:
+`cp esphome/secrets.example.yaml esphome/secrets.yaml`, edit the values, then
+`esphome run esphome/sma-bt-bridge.yaml` (on Windows: from PowerShell).
 
 Optional end-to-end test before Home Assistant (in daylight):
 
