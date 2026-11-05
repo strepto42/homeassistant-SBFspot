@@ -213,7 +213,11 @@ class L2Packet:
     dst_ctrl2: int = 0
     src_ctrl2: int = 0
     error: int = 0
-    """Packet status; 0 = OK, 21 = LRI not available, 0x0100 on logon = bad password."""
+    """Packet status; 0 = OK, 21 = LRI not available.
+
+    On a logon response 0x0100 = bad password; anything else non-zero = refused
+    (1 was seen with too many open sessions).
+    """
     fragment: int = 0
     """Count-down of follow-up packets in a multi-packet response (0 = last)."""
 

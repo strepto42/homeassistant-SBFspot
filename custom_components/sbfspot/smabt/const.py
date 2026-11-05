@@ -74,6 +74,14 @@ ENCODE_CHAR_INSTALLER = 0xBB
 LOGON_TIMEOUT = 0x00000384
 """Session timeout field of the logon request ('900 sec?' in SBFspot)."""
 LOGON_RESULT_INVALID_PASSWORD = 0x0100
+"""Logon result for a wrong password; any other non-zero result is a refusal."""
+LOGOFF_SETTLE = 0.5
+"""Seconds to keep the transport open after the final logoff (see the client).
+
+The ESP32 bridge forwards bytes over Bluetooth in its own loop; if it sees the TCP
+close before it has read the logoff, it drops the logoff and the inverter keeps the
+session (900 s) - after ~15 such sessions it refuses every logon.
+"""
 
 # Command words of the non-query packets
 CMD_WORD_IDENTIFY = 0x00000200

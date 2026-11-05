@@ -9,8 +9,10 @@ simulation output.
 
 import os
 import random
+import re
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -21,6 +23,9 @@ PORT = int(os.environ.get("SIM_PORT", "19900"))
 BT_TIMEOUT_MS = 1500
 IDLE_MS = 1500
 LOCAL = "11:22:33:44:55:66"
+# Longest time the bridge keeps the SPP link open for bytes the client sent
+# before it closed (BT_DRAIN_TIMEOUT_MS in bridge_protocol.h).
+DRAIN_TIMEOUT_S = 2.0
 
 
 class Sim:
@@ -190,6 +195,69 @@ def open_session(last, wait=6.0, line_end="\n", mac_text=None):
 def echo_roundtrip(sock, reader, payload, timeout=10.0):
     sock.sendall(payload)
     return reader.read_exact(len(payload), timeout)
+
+
+def fnv1a64(data):
+    """Same hash as the fake inverter (sim_main.cpp) logs for what it saw."""
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+
+
+def random_bytes(seed, n):
+    rng = random.Random(seed)
+    return bytes(rng.getrandbits(8) for _ in range(n))
+
+
+# What the fake inverter side logs (sim_main.cpp): the bytes the SPP stack had
+# accepted when the disconnect was handled, and the bytes the inverter had
+# received when the link was closed.
+STACK_ACCEPTED = re.compile(
+    r"link h=\d+ disconnect handled: stack_accepted=(\d+) fnv=([0-9a-f]{16})"
+)
+INVERTER_RECEIVED = re.compile(
+    r"link h=\d+ closed: inverter_received=(\d+) fnv=([0-9a-f]{16})"
+)
+
+
+def wait_link_line(sim, mark, pattern, timeout=10.0):
+    """Wait for a fake-inverter line; returns (length, hash, seconds waited)."""
+    start = time.time()
+    while time.time() - start < timeout:
+        for line in sim.since(mark):
+            m = pattern.search(line)
+            if m:
+                return int(m.group(1)), m.group(2), time.time() - start
+        time.sleep(0.01)
+    raise AssertionError(f"no {pattern.pattern!r} line within {timeout:.0f}s")
+
+
+def bridge_warnings(sim, mark):
+    return [line for line in sim.since(mark) if line.startswith("[W]")]
+
+
+def assert_inverter_got(sim, mark, data):
+    """The SPP stack had every byte before the disconnect; the inverter got all."""
+    length, digest, _ = wait_link_line(sim, mark, STACK_ACCEPTED)
+    assert (length, digest) == (len(data), fnv1a64(data)), (
+        f"SPP disconnect came with {length} of {len(data)} bytes accepted"
+    )
+    length, digest, _ = wait_link_line(sim, mark, INVERTER_RECEIVED)
+    assert (length, digest) == (len(data), fnv1a64(data)), (
+        f"inverter received {length} of {len(data)} bytes"
+    )
+
+
+def send_and_close(sock, data, how):
+    """Send the last bytes and end the connection with no delay."""
+    sock.sendall(data)
+    if how == "shutdown":
+        sock.shutdown(socket.SHUT_WR)
+    elif how == "reset":
+        # SO_LINGER 0: close() sends RST instead of FIN ("read error" on the bridge)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
 
 
 # --------------------------------------------------------------------------- tests
@@ -553,6 +621,170 @@ def many_quick_sessions(sim):
         assert echo_roundtrip(s, r, msg) == msg
         s.close()
     assert not sim.crashed()
+
+
+# --- the client sends its last bytes (SMA logoff) and closes at once -----------
+
+
+@test
+def last_bytes_before_close_reach_the_inverter(sim):
+    # Data and FIN arrive within one loop() pass, so the bridge reads the bytes
+    # and the EOF together.  Several rounds: this is a race, not a single shot.
+    for how in ("close", "shutdown", "reset"):
+        for round_no, size in enumerate((40, 120, 600, 1500)):
+            data = random_bytes(round_no, size)
+            wait_idle(sim)
+            mark = sim.mark()
+            s, _r, reply = open_session(1)
+            assert reply == "OK " + LOCAL
+            send_and_close(s, data, how)
+            try:
+                assert_inverter_got(sim, mark, data)
+            except AssertionError as exc:
+                raise AssertionError(f"{how}, {size} bytes: {exc}") from None
+            assert not bridge_warnings(sim, mark), bridge_warnings(sim, mark)
+
+
+@test
+def last_bytes_wait_for_congestion_to_clear(sim):
+    # The SPP link is congested (nothing drains for 600 ms) when the client
+    # closes: the bytes must go out when the congestion clears, and only then
+    # may the bridge disconnect.
+    data = random_bytes(21, 1600)
+    wait_idle(sim)
+    mark = sim.mark()
+    s, _r, reply = open_session(0x0E)
+    assert reply == "OK " + LOCAL
+    send_and_close(s, data, "close")
+    t_close = time.time()
+    wait_link_line(sim, mark, STACK_ACCEPTED)
+    waited = time.time() - t_close
+    assert 0.4 <= waited < DRAIN_TIMEOUT_S - 0.1, waited
+    print(f"      disconnect {waited:.2f}s after the client closed")
+    assert_inverter_got(sim, mark, data)
+    assert not bridge_warnings(sim, mark), bridge_warnings(sim, mark)
+    # What the inverter answered while the bridge was still draining is dropped.
+    assert sim.count(mark, "Discarding") >= 1, sim.since(mark)[-15:]
+    s, r, reply = open_session(1, wait=4)
+    assert reply == "OK " + LOCAL
+    assert echo_roundtrip(s, r, b"after the drain") == b"after the drain"
+    s.close()
+
+
+@test
+def drain_timeout_drops_bytes_and_frees_the_bridge(sim):
+    # Congestion that lasts 4 s outlasts the drain timeout: warn, disconnect.
+    data = random_bytes(22, 1600)
+    wait_idle(sim)
+    mark = sim.mark()
+    s, _r, reply = open_session(0x0F)
+    assert reply == "OK " + LOCAL
+    send_and_close(s, data, "close")
+    t_close = time.time()
+    accepted, _digest, _ = wait_link_line(sim, mark, STACK_ACCEPTED)
+    waited = time.time() - t_close
+    assert DRAIN_TIMEOUT_S - 0.3 <= waited <= DRAIN_TIMEOUT_S + 1.2, waited
+    print(f"      disconnect {waited:.2f}s after the client closed")
+    assert 0 < accepted < len(data), accepted
+    dropped = [
+        int(m.group(1))
+        for line in bridge_warnings(sim, mark)
+        if (m := re.search(r"dropping (\d+) bytes", line))
+    ]
+    assert dropped == [len(data) - accepted], (
+        dropped,
+        accepted,
+        bridge_warnings(sim, mark),
+    )
+    assert not sim.crashed()
+    s, r, reply = open_session(1, wait=6)
+    assert reply == "OK " + LOCAL
+    assert echo_roundtrip(s, r, b"still works") == b"still works"
+    s.close()
+
+
+@test
+def write_in_flight_is_confirmed_before_disconnect(sim):
+    # The stack confirms the write 200 ms late.  The client closes meanwhile:
+    # the bridge must wait for the confirmation (partial writes and congestion
+    # are reported through it) instead of disconnecting at once.
+    data = random_bytes(25, 100)
+    wait_idle(sim)
+    mark = sim.mark()
+    s, _r, reply = open_session(0x10)
+    assert reply == "OK " + LOCAL
+    s.sendall(data)
+    time.sleep(0.08)  # the bridge has issued the write; its confirmation is due
+    s.close()
+    t_close = time.time()
+    wait_link_line(sim, mark, STACK_ACCEPTED)
+    waited = time.time() - t_close
+    assert 0.06 <= waited < DRAIN_TIMEOUT_S - 0.1, waited
+    assert_inverter_got(sim, mark, data)
+    assert not bridge_warnings(sim, mark), bridge_warnings(sim, mark)
+
+
+@test
+def new_client_gets_busy_while_draining(sim):
+    data = random_bytes(23, 1600)
+    wait_idle(sim)
+    mark = sim.mark()
+    s, _r, reply = open_session(0x0E)
+    assert reply == "OK " + LOCAL
+    send_and_close(s, data, "close")
+    time.sleep(0.25)  # the link is still stalled: the drain is under way
+    assert sim.count(mark, "disconnect h=") == 0, "SPP disconnected too early"
+    s2 = dial()
+    r2 = LineReader(s2)
+    assert r2.line() == "ERR BUSY bridge in use"
+    _waited, extra = r2.wait_eof(3)
+    assert extra == b"", extra
+    s2.close()
+    # The rejected client did not disturb the drain.
+    assert_inverter_got(sim, mark, data)
+    s, _r, reply = open_session(1, wait=6)
+    assert reply == "OK " + LOCAL
+    s.close()
+
+
+@test
+def link_closed_by_inverter_during_drain(sim):
+    # Scenario 04: the inverter drops the link 20 ms after the first write, so
+    # most of the 1800 bytes cannot be delivered.  The bridge must say so, go
+    # back to idle and serve the next client.
+    data = random_bytes(24, 1800)
+    wait_idle(sim)
+    mark = sim.mark()
+    s, _r, reply = open_session(0x04)
+    assert reply == "OK " + LOCAL
+    send_and_close(s, data, "close")
+    assert sim.wait_for(mark, "close event", 5), sim.since(mark)[-15:]
+    s, _r, reply = open_session(1, wait=6)
+    assert reply == "OK " + LOCAL
+    s.close()
+    dropped = [line for line in bridge_warnings(sim, mark) if "dropping" in line]
+    assert len(dropped) == 1, bridge_warnings(sim, mark)
+    assert not sim.crashed()
+
+
+@test
+def early_bytes_dropped_when_client_closes_while_connecting(sim):
+    # Nothing can be delivered before the link is up: cancel and drop (the
+    # inverter must never see the link, let alone the bytes).
+    wait_idle(sim)
+    mark = sim.mark()
+    s = dial()
+    r = LineReader(s)
+    assert r.line() == "SMABT 1"
+    s.sendall(b"CONNECT AA:BB:CC:DD:EE:06\nEARLY-BYTES")  # opens only after 800 ms
+    s.close()
+    assert sim.wait_for(mark, "disconnect h=", 3), "connect was not cancelled"
+    time.sleep(1.2)
+    assert sim.count(mark, "open h=") == 0, sim.since(mark)
+    assert sim.count(mark, "stack_accepted") == 0
+    s, r, reply = open_session(1, wait=4)
+    assert reply == "OK " + LOCAL
+    s.close()
 
 
 def main():

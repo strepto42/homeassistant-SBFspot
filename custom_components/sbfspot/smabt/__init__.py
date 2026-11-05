@@ -24,6 +24,7 @@ from .errors import (
     SmaAuthError,
     SmaConnectionError,
     SmaError,
+    SmaLogonRefusedError,
     SmaProtocolError,
     SmaTimeoutError,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "SmaBluetoothClient",
     "SmaConnectionError",
     "SmaError",
+    "SmaLogonRefusedError",
     "SmaProtocolError",
     "SmaTimeoutError",
     "SpotData",

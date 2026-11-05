@@ -21,6 +21,12 @@
  *                                                       BT_CONNECT_FAILED,
  *                                                       BT_TIMEOUT
  *   after OK: transparent bidirectional byte pipe (TCP <-> RFCOMM channel 1)
+ *
+ * Either side closing ends the session.  When the client closes while bytes it
+ * sent are still queued for Bluetooth (typically its last packet, the SMA
+ * logoff), the bridge keeps the SPP link up until they are written, for at most
+ * BT_DRAIN_TIMEOUT_MS, and only then disconnects.  The wire protocol does not
+ * change.
  */
 
 #include <array>
@@ -39,6 +45,10 @@ inline constexpr size_t MAX_LINE_LENGTH = 64;
 inline constexpr uint32_t CONNECT_LINE_TIMEOUT_MS = 5000;
 /// Upper bound for waiting on the Bluetooth stack to confirm a disconnect.
 inline constexpr uint32_t TEARDOWN_TIMEOUT_MS = 5000;
+/// A client that closed while bytes it sent were still queued for Bluetooth:
+/// how long the SPP link stays up for them (the matching limit for bytes queued
+/// towards the client is CLOSE_DRAIN_TIMEOUT_MS in sma_bt_bridge.cpp).
+inline constexpr uint32_t BT_DRAIN_TIMEOUT_MS = 2000;
 
 inline constexpr size_t MAC_SIZE = 6;
 inline constexpr size_t MAC_TEXT_LENGTH = 17;  // "AA:BB:CC:DD:EE:FF"
@@ -288,6 +298,7 @@ enum class State : uint8_t {
   AWAIT_CONNECT,  ///< banner sent, waiting for the CONNECT line
   BT_CONNECTING,  ///< SPP connect to the inverter in progress
   PIPING,         ///< transparent byte pipe
+  DRAINING,       ///< client is gone; its last bytes are still being written to SPP
   TEARDOWN,       ///< client is gone; waiting for the SPP link to be released
 };
 
@@ -301,6 +312,8 @@ inline const char *state_name(State state) {
       return "BT_CONNECTING";
     case State::PIPING:
       return "PIPING";
+    case State::DRAINING:
+      return "DRAINING";
     case State::TEARDOWN:
       return "TEARDOWN";
   }
@@ -323,6 +336,10 @@ struct Actions {
   /// the handshake and belong to the data pipe.  The caller must hold them
   /// until the pipe is open (State::PIPING) or drop them if the session ended.
   size_t payload_offset{0};
+  /// on_tick() only (together with bt_disconnect): the drain ended because
+  /// BT_DRAIN_TIMEOUT_MS passed.  The caller drops what is still queued for
+  /// Bluetooth and reports it.
+  bool drain_timed_out{false};
 };
 
 /// Result of a newly accepted TCP connection.
@@ -338,9 +355,14 @@ struct AcceptResult {
  * a free-running millisecond counter (uint32_t, wrap-around safe), there is no
  * I/O and no clock access, so every transition can be unit tested.
  *
- * States: IDLE -> AWAIT_CONNECT -> BT_CONNECTING -> PIPING -> TEARDOWN -> IDLE.
+ * States: IDLE -> AWAIT_CONNECT -> BT_CONNECTING -> PIPING -> TEARDOWN -> IDLE,
+ * with DRAINING between PIPING and TEARDOWN when the client closed while bytes
+ * it sent were still queued for Bluetooth.
  * TEARDOWN exists so that a new client is not served while the previous SPP
  * link is still being torn down (the inverter accepts one link at a time).
+ * DRAINING exists so that those last bytes (the SMA logoff!) are written to the
+ * SPP link before it is disconnected; without it the inverter keeps a
+ * logged-on session for 900 s per poll.
  */
 class Session {
  public:
@@ -397,27 +419,52 @@ class Session {
         this->last_activity_ = now;
         break;
       case State::IDLE:
+      case State::DRAINING:
       case State::TEARDOWN:
         break;  // the client is already gone; drop
     }
     return actions;
   }
 
-  /// The client closed its end (EOF) or its socket failed.
-  Actions on_client_closed(uint32_t now) {
+  /// The client closed its end (EOF) or its socket failed.  @p bt_bytes_pending
+  /// is how many bytes from the client are still queued for the SPP link (this
+  /// includes a write that is in flight).  While piping, a non-zero count keeps
+  /// the SPP link up (State::DRAINING) until the caller reports on_bt_drained(),
+  /// or BT_DRAIN_TIMEOUT_MS passes.  Bytes held back while the link is still
+  /// coming up cannot be delivered: that connect is cancelled as before.
+  Actions on_client_closed(uint32_t now, size_t bt_bytes_pending = 0) {
     Actions actions;
     switch (this->state_) {
       case State::AWAIT_CONNECT:
         this->state_ = State::IDLE;
         break;
       case State::BT_CONNECTING:
-      case State::PIPING:
         actions.bt_disconnect = true;
         this->enter_(State::TEARDOWN, now);
         break;
+      case State::PIPING:
+        if (bt_bytes_pending > 0) {
+          this->enter_(State::DRAINING, now);  // the link stays up for the last bytes
+        } else {
+          actions.bt_disconnect = true;
+          this->enter_(State::TEARDOWN, now);
+        }
+        break;
       case State::IDLE:
+      case State::DRAINING:
       case State::TEARDOWN:
         break;
+    }
+    return actions;
+  }
+
+  /// State::DRAINING only: every byte the client sent has been accepted by the
+  /// SPP stack.  Disconnect the link now.
+  Actions on_bt_drained(uint32_t now) {
+    Actions actions;
+    if (this->state_ == State::DRAINING) {
+      actions.bt_disconnect = true;
+      this->enter_(State::TEARDOWN, now);
     }
     return actions;
   }
@@ -434,6 +481,11 @@ class Session {
       case State::BT_CONNECTING:
       case State::PIPING:
         actions.close_client = true;
+        actions.bt_disconnect = true;
+        this->enter_(State::TEARDOWN, now);
+        break;
+      case State::DRAINING:
+        // The client is gone already; give up on its last bytes.
         actions.bt_disconnect = true;
         this->enter_(State::TEARDOWN, now);
         break;
@@ -495,6 +547,14 @@ class Session {
           this->enter_(State::TEARDOWN, now);
         }
         break;
+      case State::DRAINING:
+        // No idle timeout here: the drain has its own, shorter deadline.
+        if (elapsed_(now, this->entered_) >= BT_DRAIN_TIMEOUT_MS) {
+          actions.bt_disconnect = true;
+          actions.drain_timed_out = true;
+          this->enter_(State::TEARDOWN, now);
+        }
+        break;
       case State::TEARDOWN:
         if (elapsed_(now, this->entered_) >= TEARDOWN_TIMEOUT_MS)
           this->state_ = State::IDLE;
@@ -535,6 +595,11 @@ class Session {
         break;
       case State::PIPING:
         actions.close_client = true;
+        this->state_ = State::IDLE;
+        break;
+      case State::DRAINING:
+        // The link is gone, so the last bytes cannot be delivered; the client
+        // is gone, too.  Nothing is left to do.
         this->state_ = State::IDLE;
         break;
       case State::TEARDOWN:

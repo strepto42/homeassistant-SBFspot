@@ -47,7 +47,9 @@ constexpr size_t TO_CLIENT_HIGH_WATER = 4096;
 /// Stop reading the TCP client while this much is waiting for SPP.
 constexpr size_t TO_BT_CAPACITY = 2048;
 
-/// How long a closing socket may keep draining queued bytes to the client.
+/// How long a closing socket may keep draining queued bytes to the client.  The
+/// mirror image, bytes from a client that closed first and are still queued for
+/// the SPP link, is bounded by protocol::BT_DRAIN_TIMEOUT_MS.
 constexpr uint32_t CLOSE_DRAIN_TIMEOUT_MS = 2000;
 /// Pause after an SPP write that was accepted only partially without congestion.
 constexpr uint32_t WRITE_RETRY_DELAY_MS = 10;
@@ -402,6 +404,7 @@ void SmaBtBridge::loop() {
   this->read_client_(now);
   this->pump_to_bt_(now);
   this->flush_to_client_();
+  this->check_drained_(now);
   this->apply_(this->session_.on_tick(now), now);
 }
 
@@ -516,6 +519,13 @@ void SmaBtBridge::handle_bt_message_(const BtMsg &msg, const uint8_t *payload, s
         this->bytes_to_client_ += static_cast<uint32_t>(payload_len);
         this->session_.on_bt_data(now);
         ESP_LOGD(TAG, "SPP -> TCP: %u bytes", static_cast<unsigned>(payload_len));
+      } else if (this->session_.state() == protocol::State::DRAINING && this->bt_handle_valid_ &&
+                 msg.handle == this->bt_handle_) {
+        // The client that would get this is gone; the link only stays up for
+        // the bytes it left behind.
+        this->drain_discarded_ += static_cast<uint32_t>(payload_len);
+        ESP_LOGD(TAG, "Discarding %u bytes of SPP data (client gone, %" PRIu32 " discarded so far)",
+                 static_cast<unsigned>(payload_len), this->drain_discarded_);
       } else {
         ESP_LOGD(TAG, "Dropping %u bytes of SPP data (no active session)", static_cast<unsigned>(payload_len));
       }
@@ -687,8 +697,20 @@ void SmaBtBridge::flush_to_client_() {
 
 void SmaBtBridge::client_gone_(const char *why, uint32_t now) {
   ESP_LOGI(TAG, "Client disconnected (%s)", why);
-  const protocol::Actions actions = this->session_.on_client_closed(now);
-  this->release_client_();
+  // The last thing a client sends is often its goodbye (the SMA logoff), and it
+  // closes right after: those bytes may still sit in to_bt_, or in a write that
+  // SPP has not confirmed yet (to_bt_ keeps the bytes of a write in flight until
+  // its WRITE_EVT).  The session then keeps the SPP link up until they are out.
+  const size_t pending = this->to_bt_.size();
+  const protocol::Actions actions = this->session_.on_client_closed(now, pending);
+  const bool draining = this->session_.state() == protocol::State::DRAINING;
+  if (draining) {
+    this->draining_ = true;
+    this->drain_discarded_ = 0;
+    ESP_LOGI(TAG, "%u bytes are still queued for Bluetooth; keeping the link up for up to %" PRIu32 " ms",
+             static_cast<unsigned>(pending), protocol::BT_DRAIN_TIMEOUT_MS);
+  }
+  this->release_client_(draining);
   this->apply_(actions, now);
 }
 
@@ -707,15 +729,47 @@ void SmaBtBridge::close_client_(bool graceful, uint32_t now) {
   this->release_client_();
 }
 
-void SmaBtBridge::release_client_() {
+void SmaBtBridge::release_client_(bool keep_bt_queue) {
   if (this->client_ == nullptr)
     return;
-  this->log_session_end_();
+  // With keep_bt_queue the session goes on without a client (State::DRAINING);
+  // finish_drain_() ends it and logs then.
+  if (!keep_bt_queue)
+    this->log_session_end_();
   discard_pending_input(*this->client_);
   this->client_.reset();
   this->closing_ = false;
   this->to_client_.clear();
+  if (!keep_bt_queue)
+    this->to_bt_.clear();
+}
+
+void SmaBtBridge::check_drained_(uint32_t now) {
+  if (this->session_.state() != protocol::State::DRAINING)
+    return;
+  // to_bt_ holds the bytes of a write in flight until its WRITE_EVT, so empty
+  // means the SPP stack has accepted every byte.
+  if (!this->to_bt_.empty() || this->write_in_flight_)
+    return;
+  this->apply_(this->session_.on_bt_drained(now), now);
+}
+
+void SmaBtBridge::finish_drain_(bool timed_out) {
+  this->draining_ = false;
+  const size_t dropped = this->to_bt_.size();
+  if (dropped == 0) {
+    ESP_LOGI(TAG, "The client's last bytes were handed to Bluetooth");
+  } else if (timed_out) {
+    ESP_LOGW(TAG, "Bluetooth did not take the client's last bytes within %" PRIu32 " ms: dropping %u bytes",
+             protocol::BT_DRAIN_TIMEOUT_MS, static_cast<unsigned>(dropped));
+  } else {
+    ESP_LOGW(TAG, "The Bluetooth link ended before the client's last bytes were sent: dropping %u bytes",
+             static_cast<unsigned>(dropped));
+  }
+  ESP_LOGD(TAG, "Drain finished; %" PRIu32 " bytes from the inverter were discarded meanwhile",
+           this->drain_discarded_);
   this->to_bt_.clear();
+  this->log_session_end_();
 }
 
 void SmaBtBridge::log_session_end_() {
@@ -736,6 +790,10 @@ void SmaBtBridge::apply_(const protocol::Actions &actions, uint32_t now) {
     this->disconnect_bt_();
   if (actions.close_client)
     this->close_client_(true, now);
+  // The drain is over as soon as the session leaves State::DRAINING: drained,
+  // timed out, aborted or the link closed.
+  if (this->draining_ && this->session_.state() != protocol::State::DRAINING)
+    this->finish_drain_(actions.drain_timed_out);
 }
 
 void SmaBtBridge::start_bt_connect_(const protocol::MacAddress &mac, uint32_t now) {
@@ -776,7 +834,9 @@ void SmaBtBridge::disconnect_bt_() {
 }
 
 void SmaBtBridge::pump_to_bt_(uint32_t now) {
-  if (this->session_.state() != protocol::State::PIPING || !this->bt_handle_valid_)
+  // Also while draining: the client is gone but its last bytes still go out.
+  const protocol::State state = this->session_.state();
+  if ((state != protocol::State::PIPING && state != protocol::State::DRAINING) || !this->bt_handle_valid_)
     return;
   // One write at a time; wait for its WRITE_EVT before sending more.
   if (this->write_in_flight_ || this->to_bt_.empty())

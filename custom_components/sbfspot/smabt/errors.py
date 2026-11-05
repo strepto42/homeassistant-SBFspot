@@ -34,5 +34,19 @@ class SmaAuthError(SmaError):
     """The inverter rejected the logon (wrong password)."""
 
 
+class SmaLogonRefusedError(SmaError):
+    """The inverter refused the logon with a result other than "wrong password".
+
+    The password may well be right.  Real case: an SB 3000TL-20 with ~15 open
+    sessions (each logon asks for a 900 s timeout) answers every logon with code 1
+    until the old sessions have timed out.  Do not start re-authentication; wait
+    for the sessions to expire.  ``code`` is the inverter's result (``packet.error``).
+    """
+
+    def __init__(self, code: int, message: str | None = None) -> None:
+        super().__init__(message or f"the inverter refused the logon (code {code})")
+        self.code = code
+
+
 class SmaProtocolError(SmaError):
     """Bad bridge greeting, ``BAD_REQUEST``, or malformed/unexpected packets."""

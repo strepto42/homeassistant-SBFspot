@@ -571,6 +571,174 @@ static void test_session_client_close_while_piping() {
   CHECK(s.on_client_accepted(5200).accepted);
 }
 
+// The client's last bytes (the SMA logoff) are still queued for Bluetooth when
+// it closes: the SPP link stays up until they are written, or the drain
+// timeout expires.
+static void test_session_client_close_with_pending_bytes_drains() {
+  Session s = make_piping_session(0);
+  Actions a = s.on_client_closed(5000, 120);
+  CHECK(s.state() == State::DRAINING);
+  CHECK(!a.bt_disconnect);  // the link stays open for the queued bytes
+  CHECK(!a.close_client);   // the client is already gone
+  CHECK(a.reply.empty() && !a.bt_connect && !a.drain_timed_out);
+
+  // Still busy for a new client; the rejection does not disturb the drain.
+  AcceptResult r = s.on_client_accepted(5010);
+  CHECK(!r.accepted);
+  CHECK_EQ(r.reply, std::string("ERR BUSY bridge in use\n"));
+  CHECK(s.state() == State::DRAINING);
+
+  // Data from a client that is gone is consumed (dropped), and SPP data no
+  // longer counts as activity.
+  a = feed(s, "late", 5020);
+  CHECK(!a.bt_connect && !a.close_client && a.reply.empty());
+  CHECK_EQ(a.payload_offset, static_cast<size_t>(4));  // consumed (dropped)
+  s.on_bt_data(5030);
+  CHECK(s.state() == State::DRAINING);
+
+  // A second close notification changes nothing.
+  a = s.on_client_closed(5040, 50);
+  CHECK(!a.bt_disconnect && !a.close_client);
+  CHECK(s.state() == State::DRAINING);
+
+  // Everything was written to SPP: now (and not earlier) disconnect.
+  a = s.on_tick(5000 + BT_DRAIN_TIMEOUT_MS - 1);
+  CHECK(!a.bt_disconnect && !a.drain_timed_out);
+  CHECK(s.state() == State::DRAINING);
+  a = s.on_bt_drained(5300);
+  CHECK(a.bt_disconnect);
+  CHECK(!a.close_client && !a.drain_timed_out && a.reply.empty());
+  CHECK(s.state() == State::TEARDOWN);
+
+  // From here on it is the usual teardown: busy until the link is released.
+  CHECK(!s.on_client_accepted(5310).accepted);
+  a = s.on_bt_closed();
+  CHECK(!a.close_client && !a.bt_disconnect && a.reply.empty());
+  CHECK(s.state() == State::IDLE);
+  CHECK(s.on_client_accepted(5400).accepted);
+}
+
+static void test_session_drain_timeout() {
+  Session s = make_piping_session(0);
+  s.on_client_closed(10000, 700);
+  CHECK(s.state() == State::DRAINING);
+
+  Actions a = s.on_tick(10000 + BT_DRAIN_TIMEOUT_MS - 1);
+  CHECK(!a.bt_disconnect && !a.drain_timed_out && !a.close_client);
+  CHECK(s.state() == State::DRAINING);
+
+  a = s.on_tick(10000 + BT_DRAIN_TIMEOUT_MS);
+  CHECK(a.bt_disconnect);
+  CHECK(a.drain_timed_out);  // the caller drops what is left and says so
+  CHECK(!a.close_client && a.reply.empty());
+  CHECK(s.state() == State::TEARDOWN);
+
+  // The timeout fires once; the usual teardown follows.
+  a = s.on_tick(10000 + BT_DRAIN_TIMEOUT_MS + 10);
+  CHECK(!a.bt_disconnect && !a.drain_timed_out);
+  CHECK(!s.on_client_accepted(10000 + BT_DRAIN_TIMEOUT_MS + 20).accepted);
+  s.on_bt_closed();
+  CHECK(s.state() == State::IDLE);
+
+  // The idle timeout does not apply while draining (it would fire at 60200
+  // here), and the deadline counts from the moment the client closed.
+  Session p = make_piping_session(0);  // last activity at t=200
+  p.on_client_closed(IDLE_TIMEOUT - 500, 10);
+  a = p.on_tick(200 + IDLE_TIMEOUT);
+  CHECK(!a.bt_disconnect && !a.close_client && !a.drain_timed_out);
+  CHECK(p.state() == State::DRAINING);
+  a = p.on_tick(IDLE_TIMEOUT - 500 + BT_DRAIN_TIMEOUT_MS - 1);
+  CHECK(!a.bt_disconnect && !a.drain_timed_out);
+  a = p.on_tick(IDLE_TIMEOUT - 500 + BT_DRAIN_TIMEOUT_MS);
+  CHECK(a.bt_disconnect && a.drain_timed_out);
+  CHECK(p.state() == State::TEARDOWN);
+
+  // millis() wraps: the deadline survives it.
+  const uint32_t near_wrap = 0xFFFFFFFFu - 500;
+  Session w = make_piping_session(near_wrap - 1000);
+  w.on_client_closed(near_wrap, 10);
+  a = w.on_tick(near_wrap + BT_DRAIN_TIMEOUT_MS - 1);
+  CHECK(!a.drain_timed_out && w.state() == State::DRAINING);
+  a = w.on_tick(near_wrap + BT_DRAIN_TIMEOUT_MS);
+  CHECK(a.drain_timed_out && a.bt_disconnect);
+}
+
+static void test_session_drain_ended_by_bt_link_loss() {
+  // The inverter drops the link while bytes are still queued: nothing left to
+  // deliver to, nothing to disconnect, the bridge is free at once.
+  Session s = make_piping_session(0);
+  s.on_client_closed(1000, 300);
+  CHECK(s.state() == State::DRAINING);
+  Actions a = s.on_bt_closed();
+  CHECK(!a.close_client && !a.bt_disconnect && a.reply.empty() && !a.drain_timed_out);
+  CHECK(s.state() == State::IDLE);
+  CHECK(s.on_client_accepted(1100).accepted);
+
+  // A write failure inside the bridge aborts the drain: disconnect, no
+  // client left to close.
+  Session t = make_piping_session(0);
+  t.on_client_closed(1000, 300);
+  a = t.on_abort(1500);
+  CHECK(a.bt_disconnect && !a.close_client && !a.drain_timed_out);
+  CHECK(t.state() == State::TEARDOWN);
+  t.on_bt_closed();
+  CHECK(t.state() == State::IDLE);
+}
+
+static void test_session_drain_events_in_other_states_are_harmless() {
+  // on_bt_drained() only means something while draining.
+  Session s = make_session();
+  Actions a = s.on_bt_drained(0);
+  CHECK(!a.bt_disconnect && !a.close_client && s.state() == State::IDLE);
+
+  CHECK(s.on_client_accepted(0).accepted);
+  a = s.on_bt_drained(1);
+  CHECK(!a.bt_disconnect && s.state() == State::AWAIT_CONNECT);
+  feed(s, CONNECT_LINE, 2);
+  a = s.on_bt_drained(3);
+  CHECK(!a.bt_disconnect && s.state() == State::BT_CONNECTING);
+  s.on_bt_connected(4);
+  a = s.on_bt_drained(5);
+  CHECK(!a.bt_disconnect && !a.close_client && s.state() == State::PIPING);
+
+  s.on_client_closed(6, 0);  // nothing pending: plain teardown
+  CHECK(s.state() == State::TEARDOWN);
+  a = s.on_bt_drained(7);
+  CHECK(!a.bt_disconnect && s.state() == State::TEARDOWN);
+}
+
+static void test_session_client_close_without_pending_bytes_is_unchanged() {
+  // Explicit zero, and the default argument, behave like before the drain.
+  Session s = make_piping_session(0);
+  Actions a = s.on_client_closed(5000, 0);
+  CHECK(a.bt_disconnect && !a.close_client && !a.drain_timed_out);
+  CHECK(s.state() == State::TEARDOWN);
+
+  // Bytes held back while the Bluetooth link is still coming up cannot be
+  // delivered: cancel the connect and drop them, as before.
+  Session c = make_session();
+  CHECK(c.on_client_accepted(0).accepted);
+  feed(c, CONNECT_LINE + "EARLY", 10);
+  CHECK(c.state() == State::BT_CONNECTING);
+  a = c.on_client_closed(100, 5);
+  CHECK(a.bt_disconnect && !a.close_client);
+  CHECK(c.state() == State::TEARDOWN);
+
+  // No bytes pending before the handshake finished: nothing to cancel.
+  Session h = make_session();
+  CHECK(h.on_client_accepted(0).accepted);
+  a = h.on_client_closed(10, 12);
+  CHECK(!a.bt_disconnect && !a.close_client);
+  CHECK(h.state() == State::IDLE);
+}
+
+static void test_state_names() {
+  CHECK_EQ(std::string(state_name(State::IDLE)), std::string("IDLE"));
+  CHECK_EQ(std::string(state_name(State::PIPING)), std::string("PIPING"));
+  CHECK_EQ(std::string(state_name(State::DRAINING)), std::string("DRAINING"));
+  CHECK_EQ(std::string(state_name(State::TEARDOWN)), std::string("TEARDOWN"));
+}
+
 static void test_session_teardown_timeout() {
   Session s = make_piping_session(0);
   s.on_client_closed(1000);
@@ -691,6 +859,12 @@ int main() {
   test_session_late_bt_connect_after_cancel();
   test_session_client_close_while_connecting();
   test_session_client_close_while_piping();
+  test_session_client_close_with_pending_bytes_drains();
+  test_session_drain_timeout();
+  test_session_drain_ended_by_bt_link_loss();
+  test_session_drain_events_in_other_states_are_harmless();
+  test_session_client_close_without_pending_bytes_is_unchanged();
+  test_state_names();
   test_session_teardown_timeout();
   test_session_idle_timeout();
   test_session_idle_timeout_without_traffic();

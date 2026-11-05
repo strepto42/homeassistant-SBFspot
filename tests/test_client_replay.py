@@ -216,18 +216,31 @@ async def test_client_works_for_other_session_ids(capture: Capture) -> None:
 # ------------------------------ errors
 
 
-@pytest.mark.parametrize("code", [0x0100, 0x0102], ids=["wrong-password", "other-code"])
-async def test_logon_rejected(capture: Capture, code: int) -> None:
+@pytest.mark.parametrize(
+    ("code", "error"),
+    [(0x0100, smabt.SmaAuthError), (0x0102, smabt.SmaLogonRefusedError)],
+    ids=["wrong-password", "other-code"],
+)
+async def test_logon_rejected(
+    capture: Capture, code: int, error: type[Exception]
+) -> None:
+    """Only 0x0100 is a wrong password; any other non-zero result is a refusal."""
     script = script_from_capture(capture)
     logon = request_index(script, LOGON)
     span = response_span(script, logon)
     rejected = rebuild_response([data for _, data in script[span] if data], error=code)
     script[span] = [("rx", frame) for frame in rejected]
 
-    bridge, transport, _ = await run_replay_expecting(
-        capture, script[: span.start + len(rejected)], smabt.SmaAuthError
+    bridge, transport, raised = await run_replay_expecting(
+        capture, script[: span.start + len(rejected)], error
     )
 
+    if error is smabt.SmaLogonRefusedError:
+        assert isinstance(raised, smabt.SmaLogonRefusedError)
+        assert raised.code == code
+        assert not isinstance(raised, smabt.SmaAuthError)
+    else:
+        assert not isinstance(raised, smabt.SmaLogonRefusedError)
     assert bridge.problems == []
     assert transport.close_calls >= 1
     await asyncio.wait_for(bridge.client_closed.wait(), 2)

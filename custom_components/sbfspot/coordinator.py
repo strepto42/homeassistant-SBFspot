@@ -10,6 +10,15 @@ coordinator therefore
   ``TOTAL_INCREASING`` sensor never reports 0 or a lower value (that would
   corrupt the long-term statistics), and
 * resets ``e_today`` to 0 at local midnight.
+
+A *refused logon* (``SmaLogonRefusedError``, e.g. code 1 when the inverter holds
+too many open sessions) is neither: the password is right and the inverter is
+awake.  It makes the entities unavailable (``UpdateFailed``, never offline zeros,
+the preserved values are not touched), starts no re-authentication, and keeps the
+integration away for ``LOGON_REFUSED_BACKOFF`` (the 900 s session timeout) so the
+old sessions can expire.  The night skip keeps priority over the back-off.  The
+deadline lives in ``hass.data``, per config entry: Home Assistant builds a new
+coordinator when it retries a failed setup and when an entry reloads.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import UNDEFINED
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
+from homeassistant.util.hass_dict import HassKey
 
 from .const import (
     CONF_BT_ADDRESS,
@@ -41,6 +51,7 @@ from .const import (
     DEFAULT_PASSWORD,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    LOGON_REFUSED_BACKOFF,
     STORAGE_VERSION,
     SUN_MARGIN,
     ZERO_WHEN_OFFLINE_FIELDS,
@@ -54,6 +65,7 @@ from .smabt import (
     SmaAuthError,
     SmaConnectionError,
     SmaError,
+    SmaLogonRefusedError,
     SpotData,
     async_read_inverter,
 )
@@ -61,6 +73,20 @@ from .smabt import (
 _LOGGER = logging.getLogger(__name__)
 
 type SbfspotConfigEntry = ConfigEntry[SbfspotCoordinator]
+
+_LOGON_REFUSALS: HassKey[dict[str, datetime]] = HassKey(DOMAIN)
+"""``hass.data[DOMAIN]``: entry id -> UTC time the back-off after a refused logon
+ends.  An entry stays in it until a logon works again (the refusal *episode*), so
+the WARNING and the INFO are logged once per episode, also across coordinators."""
+
+
+def _logon_refusals(hass: HomeAssistant) -> dict[str, datetime]:
+    return hass.data.setdefault(_LOGON_REFUSALS, {})
+
+
+def clear_logon_refusal(hass: HomeAssistant, entry_id: str) -> None:
+    """Forget the refusal episode of a removed config entry."""
+    _logon_refusals(hass).pop(entry_id, None)
 
 
 def storage_key(entry_id: str) -> str:
@@ -172,9 +198,11 @@ class SbfspotCoordinator(DataUpdateCoordinator[SbfspotData]):
 
     async def _async_update_data(self) -> SbfspotData:
         """Read the inverter, or report it offline."""
-        if not self._sun_is_near(dt_util.utcnow()):
+        now = dt_util.utcnow()
+        if not self._sun_is_near(now):
             _LOGGER.debug("The sun is down: not polling the inverter")
             return self._offline_data()
+        self._check_logon_backoff(now)
 
         data = self.config_entry.data
         transport = BridgeTransport(
@@ -188,6 +216,8 @@ class SbfspotCoordinator(DataUpdateCoordinator[SbfspotData]):
             )
         except SmaAuthError as err:
             raise ConfigEntryAuthFailed("The inverter rejected the password") from err
+        except SmaLogonRefusedError as err:
+            raise self._logon_refused(err) from err
         except SmaConnectionError as err:
             self._log_connection_error(err)
             return self._offline_data()
@@ -195,7 +225,49 @@ class SbfspotCoordinator(DataUpdateCoordinator[SbfspotData]):
             raise UpdateFailed(f"Unexpected data from the inverter: {err}") from err
 
         self._note_bridge_reachable()
+        self._note_logon_accepted()
         return await self._online_data(result)
+
+    def _check_logon_backoff(self, now: datetime) -> None:
+        """Stay away from the inverter while the back-off after a refusal runs.
+
+        Raises ``UpdateFailed`` without a connection attempt.  Once the deadline has
+        passed the next attempt decides.
+        """
+        until = _logon_refusals(self.hass).get(self.config_entry.entry_id)
+        if until is not None and now < until:
+            _LOGGER.debug(
+                "The inverter refused the logon: not connecting until %s", until
+            )
+            raise UpdateFailed(
+                "The inverter refused the logon; not connecting again before "
+                f"{dt_util.as_local(until):%H:%M:%S}"
+            )
+
+    def _logon_refused(self, err: SmaLogonRefusedError) -> UpdateFailed:
+        """Start the back-off after a refusal; returns the error to raise."""
+        refusals = _logon_refusals(self.hass)
+        new_episode = self.config_entry.entry_id not in refusals
+        refusals[self.config_entry.entry_id] = dt_util.utcnow() + LOGON_REFUSED_BACKOFF
+        minutes = int(LOGON_REFUSED_BACKOFF.total_seconds() // 60)
+        if new_episode:
+            _LOGGER.warning(
+                "The inverter refused the logon (code %s). It probably has too many "
+                "open sessions. Waiting %d minutes (the session timeout) before "
+                "trying again",
+                err.code,
+                minutes,
+            )
+        else:
+            _LOGGER.debug("The inverter still refuses the logon (code %s)", err.code)
+        return UpdateFailed(
+            f"The inverter refused the logon (code {err.code}); "
+            f"waiting {minutes} minutes before trying again"
+        )
+
+    def _note_logon_accepted(self) -> None:
+        if _logon_refusals(self.hass).pop(self.config_entry.entry_id, None) is not None:
+            _LOGGER.info("The inverter accepts the logon again")
 
     def _log_connection_error(self, err: SmaConnectionError) -> None:
         """Log an offline poll without spamming the log."""

@@ -15,6 +15,16 @@
 //   09 disconnect is ignored   0A cancelled connect completes anyway (late OPEN)
 //   0B esp_spp_connect() returns an error   0C CONG(false) event is lost
 //   0D inverter floods 200 KB unsolicited after open
+//   0E TX queue stalls 600 ms after open: nothing is drained to the inverter and
+//      the link stays congested (as soon as the queue is over the high mark)
+//   0F same, but the stall lasts 4 s (longer than the bridge's drain timeout)
+//   10 the stack takes writes at once but confirms them (WRITE_EVT) 200 ms late
+//
+// For every link the fake keeps what the stack accepted (esp_spp_write) and
+// what the inverter side received, and logs a length + FNV-1a 64 hash of both
+// when the disconnect is handled and when the link closes:
+//   FAKE: link h=1 disconnect handled: stack_accepted=N fnv=XXXXXXXXXXXXXXXX
+//   FAKE: link h=1 closed: inverter_received=N fnv=XXXXXXXXXXXXXXXX
 #include <esp_bt_device.h>
 #include <esp_gap_bt_api.h>
 #include <esp_spp_api.h>
@@ -76,7 +86,19 @@ struct Link {
   std::deque<uint8_t> outq;
   uint32_t rng{12345};
   Clock::time_point echo_at{};
+  Clock::time_point stall_until{};  // scenarios 0E/0F: the TX queue is not drained before this
+  std::vector<uint8_t> accepted;    // everything the stack took from esp_spp_write(), in order
+  std::vector<uint8_t> received;    // everything the inverter side got from the TX queue, in order
 };
+
+uint64_t fnv1a64(const std::vector<uint8_t> &data) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (const uint8_t b : data) {
+    h ^= b;
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
 
 class FakeBt {
  public:
@@ -139,7 +161,21 @@ void emit(esp_spp_cb_event_t ev, esp_spp_cb_param_t &p) {
     g_spp_cb(ev, &p);
 }
 
+// BT thread only.
+void log_disconnect_handled(uint32_t handle) {
+  auto it = g_bt.links.find(handle);
+  if (it == g_bt.links.end())
+    return;
+  flog("link h=%u disconnect handled: stack_accepted=%zu fnv=%016llx", handle, it->second.accepted.size(),
+       static_cast<unsigned long long>(fnv1a64(it->second.accepted)));
+}
+
 void emit_close(uint32_t handle, bool async) {
+  auto it = g_bt.links.find(handle);
+  if (it != g_bt.links.end()) {
+    flog("link h=%u closed: inverter_received=%zu fnv=%016llx", handle, it->second.received.size(),
+         static_cast<unsigned long long>(fnv1a64(it->second.received)));
+  }
   esp_spp_cb_param_t p{};
   p.close.status = ESP_SPP_SUCCESS;
   p.close.port_status = 0;
@@ -176,9 +212,14 @@ void do_open(uint32_t h) {
       if (it == g_bt.links.end() || it->second.closed)
         return;
       Link &lk = it->second;
+      if (Clock::now() < lk.stall_until) {
+        g_bt.post(5, [handle]() { run(handle); });  // stalled: the queue is not drained
+        return;
+      }
       size_t n = std::min(lk.outq.size(), DRAIN_PER_TICK);
       std::vector<uint8_t> chunk(lk.outq.begin(), lk.outq.begin() + static_cast<std::ptrdiff_t>(n));
       lk.outq.erase(lk.outq.begin(), lk.outq.begin() + static_cast<std::ptrdiff_t>(n));
+      lk.received.insert(lk.received.end(), chunk.begin(), chunk.end());
       // echo back in pieces of 1..40 bytes, several data events per response
       size_t off = 0;
       // Keep the echo strictly ordered across ticks: schedule on a per-link
@@ -212,6 +253,9 @@ void do_open(uint32_t h) {
   };
   g_bt.post(5, [h]() { Ticker::run(h); });
 
+  if (l.scenario == 0x0E || l.scenario == 0x0F)
+    l.stall_until = Clock::now() + std::chrono::milliseconds(l.scenario == 0x0E ? 600 : 4000);
+
   if (l.scenario == 0x0D) {
     // Unsolicited flood: 200 KB in 500 byte indications, no pacing.
     for (int i = 0; i < 400; i++) {
@@ -242,6 +286,8 @@ void do_write(uint32_t h, std::vector<uint8_t> data) {
       size_t n = std::min<size_t>(300, data.size() - accepted);
       l.outq.insert(l.outq.end(), data.begin() + static_cast<std::ptrdiff_t>(accepted),
                     data.begin() + static_cast<std::ptrdiff_t>(accepted + n));
+      l.accepted.insert(l.accepted.end(), data.begin() + static_cast<std::ptrdiff_t>(accepted),
+                        data.begin() + static_cast<std::ptrdiff_t>(accepted + n));
       accepted += n;
     }
     if (l.outq.size() > TXQ_HIGH_WM)
@@ -253,7 +299,12 @@ void do_write(uint32_t h, std::vector<uint8_t> data) {
     p.write.len = -1;
   }
   p.write.cong = l.cong;
-  emit(ESP_SPP_WRITE_EVT, p);
+  if (l.scenario == 0x10) {
+    // The bytes are queued at once, the confirmation comes late.
+    g_bt.post(200, [p]() mutable { emit(ESP_SPP_WRITE_EVT, p); });
+  } else {
+    emit(ESP_SPP_WRITE_EVT, p);
+  }
 
   if (l.scenario == 0x04 && !l.remote_close_done) {
     l.remote_close_done = true;
@@ -361,6 +412,8 @@ esp_err_t esp_spp_disconnect(uint32_t h) {
     if (it == g_bt.links.end() || it->second.closed)
       return;
     Link &l = it->second;
+    if (l.open)
+      log_disconnect_handled(h);
     if (l.scenario == 0x09)
       return;  // stack never answers
     if (!l.open) {

@@ -57,8 +57,11 @@ Python side: `smabt/transport.py` docstring. Firmware side:
 2. Client sends `CONNECT AA:BB:CC:DD:EE:FF\n` within 5 s.
 3. Bridge replies `OK <ESP32 BT MAC>\n` then pipes bytes, or
    `ERR <BAD_REQUEST|BT_CONNECT_FAILED|BT_TIMEOUT|BUSY> <text>\n` and closes.
-4. Either side closing ends the session. Right after a session the bridge may
-   answer `ERR BUSY` briefly; `BridgeTransport.open()` retries for ~6 s.
+4. Either side closing ends the session. When the client closes, the bridge
+   first sends any bytes still queued for Bluetooth (state `DRAINING`, max
+   `BT_DRAIN_TIMEOUT_MS` = 2 s), then drops the link. Right after a session the
+   bridge may answer `ERR BUSY` briefly; `BridgeTransport.open()` retries for
+   ~6 s.
 
 Any change to this protocol needs a new greeting version and matching tests on
 both sides.
@@ -75,7 +78,17 @@ both sides.
   `energy_today` keeps its value until local midnight, then 0. A wrong 0
   permanently corrupts long-term statistics. Tests in `tests/ha/` lock this —
   extend them, never relax them.
-- **Auth errors** (`SmaAuthError`) raise `ConfigEntryAuthFailed` (reauth flow).
+- **The logoff must reach the inverter.** Each logon opens a session on the
+  inverter for 900 s. If the final logoff is lost, sessions pile up and after
+  ~15 polls the inverter refuses every logon with L2 error code 1 (seen on real
+  hardware in 0.1.0: the bridge cleared its to-Bluetooth queue on TCP close).
+  Two guards, keep both: the client drains and waits `LOGOFF_SETTLE` after the
+  logoff before it closes TCP; the bridge sends all queued bytes over SPP
+  before it disconnects.
+- **Auth errors.** Only logon code `0x0100` is a wrong password
+  (`SmaAuthError` -> `ConfigEntryAuthFailed`, reauth flow). Any other non-zero
+  code is `SmaLogonRefusedError`: entities go unavailable and the coordinator
+  makes no logon for 15 minutes. Never start reauth for it.
 - **Fixtures are sanitized real captures.** `tests/fixtures/sb3000tl20_session.json`
   came from a real SBFspot `-d5` session. It must never contain the real
   inverter MAC, adapter MAC, serial or password.

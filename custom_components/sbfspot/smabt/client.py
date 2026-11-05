@@ -13,9 +13,10 @@ One poll is the same conversation SBFspot has with the inverter::
     client   -> broadcast identify (L2)    inverter answers with SUSyID + serial
     client   -> logoff (L2)                SBFspot resets the session before logging on
     client   -> signal strength request (cmd 3) / inverter -> cmd 4
-    client   -> logon (L2) / inverter -> result (0 = OK, 0x0100 = wrong password)
+    client   -> logon (L2) / inverter -> result (0 = OK, 0x0100 = wrong password,
+                anything else = refused, e.g. 1 when too many sessions are open)
     client   -> 14 queries (L2), each answered by one or more L2 packets
-    client   -> logoff (L2)
+    client   -> logoff (L2), then a short pause before the transport is closed
 
 Everything is ``asyncio``; the transport is injected (see :mod:`.transport`).
 """
@@ -52,6 +53,7 @@ from .const import (
     ENCODE_CHAR_INSTALLER,
     ENCODE_CHAR_USER,
     LOGOFF_ARGUMENT,
+    LOGOFF_SETTLE,
     LOGON_RESULT_INVALID_PASSWORD,
     LOGON_TIMEOUT,
     MAX_RESYNC_BYTES,
@@ -64,7 +66,12 @@ from .const import (
     USER_GROUP_USER,
     Query,
 )
-from .errors import SmaAuthError, SmaProtocolError, SmaTimeoutError
+from .errors import (
+    SmaAuthError,
+    SmaLogonRefusedError,
+    SmaProtocolError,
+    SmaTimeoutError,
+)
 from .frame import (
     L1Frame,
     L2Packet,
@@ -111,7 +118,9 @@ class SmaBluetoothClient:
     * ``session_id`` - the random "serial number" of this application
       (``genSessionID()``: 900000000 + random),
     * ``clock`` - source of the timestamp sent in the logon request,
-    * ``packet_id_seed`` - ``pcktID`` before the first request (SBFspot: 1).
+    * ``packet_id_seed`` - ``pcktID`` before the first request (SBFspot: 1),
+    * ``logoff_settle`` - seconds to wait after the final logoff before the
+      transport is closed (see :meth:`_final_logoff`).
     """
 
     def __init__(
@@ -125,8 +134,10 @@ class SmaBluetoothClient:
         clock: Callable[[], float] = time.time,
         packet_id_seed: int = 1,
         installer: bool = False,
+        logoff_settle: float = LOGOFF_SETTLE,
     ) -> None:
         self._transport = transport
+        self._logoff_settle = logoff_settle
         self._timeout = timeout
         self._session_id = (
             900_000_000 + secrets.randbelow(100_000_000)
@@ -178,7 +189,7 @@ class SmaBluetoothClient:
                 for record in response:
                     values.add(record)
 
-        await self._logoff()
+        await self._final_logoff()
 
         info = DeviceInfo(
             serial=self._serial,
@@ -192,14 +203,20 @@ class SmaBluetoothClient:
         return InverterData(info=info, spot=values.spot_data(signal))
 
     async def _shutdown(self) -> None:
-        """Best-effort logoff if still logged on, then close the transport."""
-        if self._logged_on:
-            with contextlib.suppress(Exception):
-                await self._logoff()
+        """Best-effort logoff if still logged on, then close the transport.
+
+        The transport is closed even if the task is cancelled during the logoff or
+        the pause that follows it.
+        """
         try:
-            await self._transport.close()
-        except Exception:
-            _LOGGER.debug("error while closing the transport", exc_info=True)
+            if self._logged_on:
+                with contextlib.suppress(Exception):
+                    await self._final_logoff()
+        finally:
+            try:
+                await self._transport.close()
+            except Exception:
+                _LOGGER.debug("error while closing the transport", exc_info=True)
 
     # ------------------------------ initialise
 
@@ -304,7 +321,9 @@ class SmaBluetoothClient:
         if packet.error == LOGON_RESULT_INVALID_PASSWORD:
             raise SmaAuthError("the inverter rejected the password")
         if packet.error != 0:
-            raise SmaAuthError(f"logon rejected by the inverter (code {packet.error})")
+            # Not a password problem: e.g. code 1 once the inverter holds too many
+            # open sessions.  Only 0x0100 means a wrong password.
+            raise SmaLogonRefusedError(packet.error)
         self._logged_on = True
         _LOGGER.debug("logged on")
 
@@ -320,6 +339,23 @@ class SmaBluetoothClient:
         )
         self._logged_on = False
         await self._send(frame)
+
+    async def _final_logoff(self) -> None:
+        """The logoff that ends a session, delivered before the transport closes.
+
+        :meth:`_logoff` returns once the bytes are handed to the OS (the transport
+        drains its writer).  The ESP32 bridge forwards them over Bluetooth in its own
+        loop and drops the Bluetooth link as soon as it sees the TCP close, which can
+        be before it has read the logoff.  The inverter then keeps the session for
+        the 900 s of the logon request, and after ~15 polls it refuses every logon.
+        So the client waits ``logoff_settle`` seconds before it closes.
+
+        Only called after a logon: a session that never got that far has nothing to
+        log off, so it must not wait.
+        """
+        await self._logoff()
+        if self._logoff_settle > 0:
+            await asyncio.sleep(self._logoff_settle)
 
     # ------------------------------ queries
 
@@ -506,7 +542,9 @@ async def async_read_inverter(
     Raises:
         SmaConnectionError (and subclasses): the inverter could not be reached or
             stopped answering.
-        SmaAuthError: the logon was rejected.
+        SmaAuthError: the inverter rejected the password.
+        SmaLogonRefusedError: the inverter refused the logon for another reason
+            (code 1: too many open sessions); the password may be right.
         SmaProtocolError: unexpected or malformed data.
     """
     return await SmaBluetoothClient(transport, password, timeout=timeout).async_read()
