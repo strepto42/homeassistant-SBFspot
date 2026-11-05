@@ -312,10 +312,15 @@ async def test_a_refusal_during_setup_retries_setup_without_reauth(
 async def _retry_setup(
     hass: HomeAssistant, freezer: FrozenDateTimeFactory, seconds: float = 90
 ) -> None:
-    """Let the time pass and fire the setup retry that Home Assistant scheduled."""
+    """Let the time pass and fire the setup retry that Home Assistant scheduled.
+
+    Home Assistant runs the retried setup as a *background* task, which
+    ``async_block_till_done()`` does not wait for by default: the test would race
+    the retry (platform forwarding included) and see ``SETUP_IN_PROGRESS``.
+    """
     freezer.tick(timedelta(seconds=seconds))
     async_fire_time_changed(hass)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
 
 async def test_setup_retries_stay_away_from_the_inverter_for_15_minutes(
