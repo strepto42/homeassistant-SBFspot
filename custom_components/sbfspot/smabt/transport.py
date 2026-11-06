@@ -19,6 +19,9 @@ seconds) to release that link, so a client that connects again right after a ses
 may be answered ``ERR BUSY``: :meth:`BridgeTransport.open` therefore retries with a
 short backoff before it raises :class:`BridgeBusyError`.
 
+A bridge may drop a frame that is still unread when it sees the close.  The client
+therefore pauses (``LOGOFF_SETTLE``) between its final logoff and :meth:`close`.
+
 The bridge also hangs up *without a message* if no ``CONNECT`` arrives in time or if
 a client reads so slowly that its buffer overflows; mid-session that surfaces as a
 :class:`SmaConnectionError` from :meth:`BridgeTransport.read` (not a timeout).
@@ -72,7 +75,11 @@ class Transport(Protocol):
         ...
 
     async def write(self, data: bytes) -> None:
-        """Send *data*."""
+        """Send *data*; return only after it was handed to the OS (drained).
+
+        The client relies on this: after its final logoff it waits a moment and
+        closes, and the close must not overtake the logoff.
+        """
         ...
 
     async def close(self) -> None:

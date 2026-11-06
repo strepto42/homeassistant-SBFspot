@@ -117,5 +117,14 @@ Not affiliated with SMA Solar Technology AG.
 
 ## Changelog
 
+- **0.1.1** — Fix: the inverter refused every logon (error code 1) after about
+  15 polls, and the integration asked for the password again. The cause: the
+  bridge dropped the final logoff of each poll, so each poll left a session open
+  on the inverter (15 minutes each). Now the client waits until the logoff is
+  sent before it closes the connection. A refused logon is no longer a wrong
+  password: the entities become unavailable, no re-authentication starts, and the
+  integration waits 15 minutes before it tries again. **Flash the new bridge
+  firmware to the ESP32** for the firmware part of the fix. The update of the
+  integration alone already stops the problem.
 - **0.1.0** — First release: SMA Bluetooth protocol client, ESP32 bridge
   firmware, Home Assistant integration.

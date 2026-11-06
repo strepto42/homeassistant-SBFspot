@@ -51,6 +51,7 @@ from .smabt import (
     InverterUnreachableError,
     SmaAuthError,
     SmaConnectionError,
+    SmaLogonRefusedError,
     SmaProtocolError,
     SmaTimeoutError,
     async_read_inverter,
@@ -129,6 +130,8 @@ async def async_validate(
         raise ValidationError("cannot_connect") from err
     except SmaAuthError as err:
         raise ValidationError("invalid_auth") from err
+    except SmaLogonRefusedError as err:
+        raise ValidationError("logon_refused") from err
     except SmaProtocolError as err:
         raise ValidationError("protocol_error") from err
     except Exception as err:

@@ -13,6 +13,7 @@ from .coordinator import (
     SbfspotConfigEntry,
     SbfspotCoordinator,
     async_remove_stored_data,
+    clear_logon_refusal,
 )
 
 PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
@@ -37,5 +38,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: SbfspotConfigEntry) -> 
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: SbfspotConfigEntry) -> None:
-    """Delete the preserved values of a removed config entry."""
+    """Delete the preserved values and the logon back-off of a removed entry."""
+    clear_logon_refusal(hass, entry.entry_id)
     await async_remove_stored_data(hass, entry.entry_id)

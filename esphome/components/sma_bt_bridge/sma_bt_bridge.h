@@ -88,17 +88,25 @@ class SmaBtBridge : public Component {
   void read_client_(uint32_t now);
   void pump_to_bt_(uint32_t now);
   void flush_to_client_();
+  /// State::DRAINING: once SPP has accepted the client's last bytes, hand over
+  /// to the session so that it disconnects the link.
+  void check_drained_(uint32_t now);
 
   // --- session glue ---
   /// Carry out what the protocol::Session asked for.
   void apply_(const protocol::Actions &actions, uint32_t now);
   void start_bt_connect_(const protocol::MacAddress &mac, uint32_t now);
   void disconnect_bt_();
-  /// The client socket failed or was closed by the peer.
+  /// The client socket failed or was closed by the peer.  Bytes it sent that
+  /// are still queued for SPP are not dropped: see State::DRAINING.
   void client_gone_(const char *why, uint32_t now);
   /// Close the client socket; with @p graceful, first let queued bytes drain.
   void close_client_(bool graceful, uint32_t now);
-  void release_client_();
+  /// Drop the client socket and the bytes queued for it.  The bytes queued for
+  /// SPP go as well, except with @p keep_bt_queue (State::DRAINING).
+  void release_client_(bool keep_bt_queue = false);
+  /// The session left State::DRAINING: report and drop what SPP did not take.
+  void finish_drain_(bool timed_out);
   void log_session_end_();
   /// Send a one-line reply to a connection that is not served, then close it.
   void reject_connection_(std::unique_ptr<socket::Socket> sock, const std::string &reply);
@@ -114,7 +122,9 @@ class SmaBtBridge : public Component {
   std::unique_ptr<socket::Socket> client_;
   /// Bytes waiting to be written to the client socket (control lines + SPP data).
   protocol::ByteFifo to_client_;
-  /// Bytes read from the client that SPP has not accepted yet.
+  /// Bytes read from the client that SPP has not accepted yet.  The bytes of a
+  /// write in flight stay here until its WRITE_EVT.  After the client is gone
+  /// they are kept for State::DRAINING.
   protocol::ByteFifo to_bt_;
   bool closing_{false};  ///< client socket closes once to_client_ has drained
   uint32_t closing_since_{0};
@@ -140,6 +150,8 @@ class SmaBtBridge : public Component {
   uint32_t session_start_{0};
   uint32_t bytes_to_bt_{0};
   uint32_t bytes_to_client_{0};
+  bool draining_{false};         ///< client gone, its last bytes are still going to SPP
+  uint32_t drain_discarded_{0};  ///< SPP bytes thrown away while draining (for the logs)
 
   // --- Bluetooth task -> loop() hand-over ---
   MessageBufferHandle_t messages_{nullptr};

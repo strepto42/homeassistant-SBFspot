@@ -48,6 +48,7 @@
       "inverter_unreachable": "The bridge cannot reach the inverter over Bluetooth. The inverter's Bluetooth radio sleeps when there is no sun, so try again in daylight and check the Bluetooth address.",
       "cannot_connect": "The connection to the inverter failed. Try again.",
       "invalid_auth": "The inverter rejected the password.",
+      "logon_refused": "The inverter refused the logon (it may still have open sessions). Wait 15 minutes and try again.",
       "protocol_error": "The bridge or the inverter sent data that this integration does not understand.",
       "invalid_bt_address": "This is not a Bluetooth address. Use the form 00:80:25:AA:BB:CC.",
       "unknown": "Unexpected error. Check the Home Assistant log."

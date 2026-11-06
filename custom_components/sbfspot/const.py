@@ -34,6 +34,14 @@ The inverter's Bluetooth radio sleeps without sunlight; outside this window the
 coordinator reports the inverter as offline without opening a connection.
 """
 
+LOGON_REFUSED_BACKOFF: Final = timedelta(seconds=900)
+"""How long to stay away after the inverter refused a logon.
+
+The logon request asks for a 900 s session timeout (``LOGON_TIMEOUT`` in ``smabt``).
+A refusal means the inverter still holds open sessions; they are gone 900 s after
+their last use, and every new logon attempt is wasted until then.
+"""
+
 MANUFACTURER: Final = "SMA"
 
 # Spot values that are cumulative counters (SensorStateClass.TOTAL_INCREASING).
