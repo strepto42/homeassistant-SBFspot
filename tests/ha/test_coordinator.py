@@ -28,7 +28,7 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
 )
 
-from custom_components.sbfspot.const import DOMAIN
+from custom_components.sbfspot.const import DOMAIN, MAX_MISSED_POLLS
 from custom_components.sbfspot.coordinator import storage_key
 from custom_components.sbfspot.smabt import (
     BridgeBusyError,
@@ -48,6 +48,7 @@ from .conftest import (
     make_inverter_data,
     number,
     refresh,
+    refresh_past_the_grace,
     setup_entry,
     state_of,
 )
@@ -213,7 +214,7 @@ async def test_connection_errors_are_offline_data_not_failures(
     await setup_entry(hass, mock_config_entry)
     bridge.read.side_effect = error
 
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
 
     assert mock_config_entry.runtime_data.last_update_success is True
     assert not _data(mock_config_entry).online
@@ -230,21 +231,21 @@ async def test_the_offline_values_follow_the_rules(
     await setup_entry(hass, mock_config_entry)
     bridge.read.side_effect = InverterUnreachableError("asleep")
 
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
 
     assert _data(mock_config_entry).spot == SpotData(
-        # instantaneous power and current: 0
-        pac_total=0.0,
-        pac1=0.0,
-        pac2=0.0,
-        pac3=0.0,
-        pdc1=0.0,
-        pdc2=0.0,
-        iac1=0.0,
-        iac2=0.0,
-        iac3=0.0,
-        idc1=0.0,
-        idc2=0.0,
+        # A missed daytime sample is unknown, never 0 (only the night is 0 W).
+        pac_total=None,
+        pac1=None,
+        pac2=None,
+        pac3=None,
+        pdc1=None,
+        pdc2=None,
+        iac1=None,
+        iac2=None,
+        iac3=None,
+        idc1=None,
+        idc2=None,
         # voltages, frequency, temperature, signal, status: unknown
         uac1=None,
         uac2=None,
@@ -274,13 +275,18 @@ async def test_offline_entity_states(
     assert number(hass, "power") == 622
     bridge.read.side_effect = InverterUnreachableError("asleep")
 
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
 
-    for key in ("power", "ac_power_l1", "ac_power_l2", "ac_power_l3"):
-        assert number(hass, key) == 0, key
-    for key in ("dc_power_a", "dc_power_b", "ac_current_l1", "dc_current_a"):
-        assert number(hass, key) == 0, key
     for key in (
+        # A missed daytime sample is unknown, never 0 (only the night is 0 W).
+        "power",
+        "ac_power_l1",
+        "ac_power_l2",
+        "ac_power_l3",
+        "dc_power_a",
+        "dc_power_b",
+        "ac_current_l1",
+        "dc_current_a",
         "ac_voltage_l1",
         "ac_voltage_l2",
         "ac_voltage_l3",
@@ -790,7 +796,7 @@ async def test_unexpected_data_makes_the_entities_unavailable(
     assert number(hass, "power") == 622
 
     bridge.read.side_effect = SmaProtocolError("garbage")
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
 
     assert mock_config_entry.runtime_data.last_update_success is False
     assert state_of(hass, "power") == STATE_UNAVAILABLE
@@ -836,7 +842,7 @@ async def test_an_unreachable_bridge_is_warned_about_once_until_it_answers(
     caplog.clear()
     bridge.read.side_effect = BridgeUnreachableError("connection refused")
 
-    for _ in range(4):
+    for _ in range(MAX_MISSED_POLLS + 3):  # the grace first, then three more
         await refresh(hass, mock_config_entry)
 
     warnings = [r for r in _coordinator_records(caplog) if r.levelno >= logging.WARNING]
@@ -856,12 +862,15 @@ async def test_an_unreachable_bridge_is_warned_about_once_until_it_answers(
         r.getMessage()
         for r in _coordinator_records(caplog)
         if r.levelno == logging.INFO
-    ] == ["The SMA Bluetooth bridge is reachable again"]
+    ] == [
+        "The SMA Bluetooth bridge is reachable again",
+        f"Poll succeeded again after {MAX_MISSED_POLLS + 3} missed polls",
+    ]
 
     # ... so the next outage is reported again.
     caplog.clear()
     bridge.read.side_effect = BridgeUnreachableError("timed out")
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
     await refresh(hass, mock_config_entry)
     warnings = [r for r in _coordinator_records(caplog) if r.levelno >= logging.WARNING]
     assert len(warnings) == 1
@@ -892,8 +901,9 @@ async def test_other_offline_errors_are_never_warnings(
         await refresh(hass, mock_config_entry)
 
     records = _coordinator_records(caplog)
-    assert records, "the offline poll should be logged at DEBUG"
-    assert all(r.levelno == logging.DEBUG for r in records)
+    assert records, "the missed polls should be logged"
+    # INFO for each missed poll of the grace (see test_poll_resilience), never more.
+    assert all(r.levelno < logging.WARNING for r in records)
 
 
 async def test_a_bridge_that_answers_resets_the_unreachable_warning(
@@ -905,7 +915,7 @@ async def test_a_bridge_that_answers_resets_the_unreachable_warning(
     """The bridge answered (the inverter is asleep): a later outage is a new one."""
     await setup_entry(hass, mock_config_entry)
     bridge.read.side_effect = BridgeUnreachableError("refused")
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
     caplog.clear()
 
     bridge.read.side_effect = InverterUnreachableError("asleep")

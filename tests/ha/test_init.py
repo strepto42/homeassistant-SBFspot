@@ -142,9 +142,10 @@ async def test_setup_with_the_inverter_asleep_succeeds(
     await setup_entry(hass, mock_config_entry)
 
     assert mock_config_entry.state is ConfigEntryState.LOADED
-    assert bridge.reads == 1
+    assert bridge.reads == 2  # one attempt and its retry
     assert state_of(hass, "inverter_online", "binary_sensor") == "off"
-    assert number(hass, "power") == 0
+    # A missed daytime sample is unknown, never 0 (only the night is 0 W).
+    assert state_of(hass, "power") == STATE_UNKNOWN
     assert entity_id(hass, "sensor", "energy_total")
 
 

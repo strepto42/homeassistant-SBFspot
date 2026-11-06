@@ -15,6 +15,7 @@ from .conftest import (
     Bridge,
     entity_id,
     refresh,
+    refresh_past_the_grace,
     setup_entry,
     state_of,
 )
@@ -63,7 +64,7 @@ async def test_offline_when_the_inverter_cannot_be_reached(
     assert _online(hass) == "on"
 
     bridge.read.side_effect = error
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
     assert _online(hass) == "off"
 
     bridge.read.side_effect = None
@@ -95,6 +96,6 @@ async def test_unavailable_only_on_an_update_failure(
     await setup_entry(hass, mock_config_entry)
 
     bridge.read.side_effect = SmaProtocolError("garbage")
-    await refresh(hass, mock_config_entry)
+    await refresh_past_the_grace(hass, mock_config_entry)
 
     assert _online(hass) == STATE_UNAVAILABLE
