@@ -21,7 +21,13 @@ from custom_components.sbfspot.const import (
 )
 from custom_components.sbfspot.smabt import InverterUnreachableError
 
-from .conftest import BT_ADDRESS, SERIAL, Bridge, refresh, setup_entry
+from .conftest import (
+    BT_ADDRESS,
+    SERIAL,
+    Bridge,
+    refresh_past_the_grace,
+    setup_entry,
+)
 
 REDACTED = "**REDACTED**"
 SECRET_PASSWORD = "s3cret-Pa55"
@@ -96,13 +102,13 @@ async def test_diagnostics_while_offline(
 ) -> None:
     await setup_entry(hass, secret_entry)
     bridge.read.side_effect = InverterUnreachableError("asleep")
-    await refresh(hass, secret_entry)
+    await refresh_past_the_grace(hass, secret_entry)
 
     result = await get_diagnostics_for_config_entry(hass, hass_client, secret_entry)
 
     data = result["coordinator"]["data"]
     assert data["online"] is False
-    assert data["spot"]["pac_total"] == 0.0
+    assert data["spot"]["pac_total"] is None  # a missed daytime sample, not 0
     assert data["spot"]["e_total"] == pytest.approx(60854.831)
     assert SECRET_PASSWORD not in json.dumps(result)
 

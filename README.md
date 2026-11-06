@@ -91,13 +91,25 @@ bridge address. A wrong password starts a re-authentication flow.
 ## Night behaviour
 
 The integration polls only from 15 minutes before sunrise to 15 minutes after
-sunset. When the inverter cannot be reached:
+sunset. At night the inverter sleeps:
 
-- power and current show 0;
+- power and current show 0. This is the only time they show 0;
 - voltage, frequency, temperature and status show unknown;
 - *Energy total*, *Operating time* and *Feed-in time* keep their last value.
   They never drop to 0 and never go down, also after a restart;
 - *Energy today* keeps its value until midnight, then shows 0.
+
+## Missed polls in daylight
+
+A poll can fail in daylight (a Bluetooth glitch, a busy bridge). A missed
+sample is never 0:
+
+- For up to 3 missed polls in a row, the sensors keep the last values. This
+  holds only if the last good poll is recent. It never holds across the night.
+- After that, power, current, voltage, frequency, temperature and status show
+  unknown, and *Inverter online* is off. The totals and *Energy today* keep
+  their values. If the inverter sends bad data, the entities become unavailable.
+- The next good poll shows fresh values again.
 
 ## Debug logging
 
@@ -117,6 +129,21 @@ Not affiliated with SMA Solar Technology AG.
 
 ## Changelog
 
+- **0.1.2** — A few missed polls no longer show as a glitch. Before, one failed
+  poll in daylight showed 0 W and unknown values at once. Now a missed daytime
+  sample is **unknown, not 0**. 0 W shows only at night, when the inverter
+  sleeps. After a failed poll the sensors keep the last values for up to 3 polls
+  in a row, if the last good poll is recent. Never yesterday's values. After
+  that, the power, voltage and other live values are unknown, and *Inverter
+  online* is off. The totals keep their last valid value. A failed attempt is
+  tried once more after 2 seconds, if at least 15 seconds of the poll time are
+  left. One poll must end within the poll interval
+  minus 2 seconds (at least 20 seconds); a poll that takes longer is cancelled
+  and counts as missed. Reads no longer overlap: one lock per bridge covers the
+  polls and the checks in the setup, reconfigure and password dialogs, so a
+  second read cannot make the bridge answer *busy*. The log shows each missed poll
+  (INFO), one warning when the sensors go unknown (INFO only, within an hour of
+  sunrise or sunset), and the recovery. The diagnostics show poll statistics.
 - **0.1.1** — Fix: the inverter refused every logon (error code 1) after about
   15 polls, and the integration asked for the password again. The cause: the
   bridge dropped the final logoff of each poll, so each poll left a session open

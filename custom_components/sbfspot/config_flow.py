@@ -4,6 +4,10 @@ Every step proves that the settings work by reading the inverter once, through
 the ESP32 bridge: ``async_read_inverter(BridgeTransport(...), password)``.
 That needs the inverter's Bluetooth radio, which sleeps without sunlight, so
 set up, reconfigure and re-authenticate in daylight.
+
+The bridge serves one client at a time, so the read holds the lock of its bridge
+(see ``bridge_lock``) and waits up to ``CONFIG_FLOW_LOCK_TIMEOUT`` seconds while a
+poll or another validation uses it; after that the form shows ``bridge_busy``.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from homeassistant.config_entries import (
     OptionsFlow,
     OptionsFlowWithReload,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.selector import (
     NumberSelector,
@@ -30,12 +34,14 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from .bridge_lock import hold_bridge
 from .const import (
     CONF_BT_ADDRESS,
     CONF_HOST,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
+    CONFIG_FLOW_LOCK_TIMEOUT,
     DEFAULT_BRIDGE_PORT,
     DEFAULT_PASSWORD,
     DEFAULT_SCAN_INTERVAL,
@@ -110,16 +116,23 @@ class ValidationError(HomeAssistantError):
 
 
 async def async_validate(
-    host: str, port: int, bt_address: str, password: str
+    hass: HomeAssistant, host: str, port: int, bt_address: str, password: str
 ) -> DeviceInfo:
     """Read the inverter once and return its device info.
+
+    The read waits for the bridge while a poll or another validation uses it.
 
     Raises:
         ValidationError: with the key of the error string to show.
     """
     transport = BridgeTransport(host, port, bt_address)
     try:
-        result = await async_read_inverter(transport, password)
+        async with hold_bridge(hass, host, port, max_wait=CONFIG_FLOW_LOCK_TIMEOUT):
+            result = await async_read_inverter(transport, password)
+    except TimeoutError as err:
+        # Only the wait for the bridge can end like this: the client turns its own
+        # timeouts into ``SmaTimeoutError``.
+        raise ValidationError("bridge_busy") from err
     except BridgeUnreachableError as err:
         raise ValidationError("bridge_unreachable") from err
     except BridgeBusyError as err:
@@ -166,7 +179,9 @@ class SbfspotConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_BT_ADDRESS] = "invalid_bt_address"
             else:
                 try:
-                    info = await async_validate(host, port, bt_address, password)
+                    info = await async_validate(
+                        self.hass, host, port, bt_address, password
+                    )
                 except ValidationError as err:
                     errors["base"] = err.error
                 else:
@@ -205,7 +220,7 @@ class SbfspotConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 try:
                     info = await async_validate(
-                        host, port, bt_address, entry.data[CONF_PASSWORD]
+                        self.hass, host, port, bt_address, entry.data[CONF_PASSWORD]
                     )
                 except ValidationError as err:
                     errors["base"] = err.error
@@ -245,6 +260,7 @@ class SbfspotConfigFlow(ConfigFlow, domain=DOMAIN):
             password = user_input[CONF_PASSWORD]
             try:
                 info = await async_validate(
+                    self.hass,
                     entry.data[CONF_HOST],
                     entry.data[CONF_PORT],
                     entry.data[CONF_BT_ADDRESS],

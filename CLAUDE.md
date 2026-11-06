@@ -68,10 +68,22 @@ both sides.
 
 ## Critical invariants
 
-- **Night is normal.** The inverter's Bluetooth sleeps without sun. Connection
-  errors (`SmaConnectionError` and subclasses) give *offline* data, never
-  `UpdateFailed`. Setup at night must succeed. The coordinator does not poll
-  outside sunrise − 15 min .. sunset + 15 min (SBFspot `SunRSOffset=900`).
+- **Night is normal.** The inverter's Bluetooth sleeps without sun. The
+  coordinator does not poll outside sunrise − 15 min .. sunset + 15 min
+  (SBFspot `SunRSOffset=900`); then it reports *offline* data (power/current
+  0). Setup at night must succeed. The night skip is the **only** path that
+  reports 0 W.
+- **A missed daytime sample is never 0.** Connection errors
+  (`SmaConnectionError` and subclasses) and protocol errors are *misses*. Up to
+  `MAX_MISSED_POLLS` (3) misses in a row repeat the last online data, if that
+  success is recent (within (3 + 1) × interval; never across a night). After
+  that, connection errors give *unknown* data (all instantaneous values `None`,
+  `inverter_online` off, totals preserved), protocol errors `UpdateFailed`.
+  Auth and logon-refused errors are not misses.
+- **Polls never overlap.** One lock per bridge (host + port) serialises every
+  inverter read: coordinator polls and config-flow validations. Each poll runs
+  under a budget of interval − 2 s (min 20 s), with at most one retry inside it,
+  and only if `RETRY_MIN_BUDGET_LEFT` (15 s) of the budget is left.
 - **TOTAL_INCREASING sensors never report 0 or go down.** `energy_total`,
   `operating_time`, `feed_in_time` keep the last valid value (persisted with
   `Store`) when offline and when the inverter returns NaN/0/a lower value.

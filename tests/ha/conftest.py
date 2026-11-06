@@ -34,6 +34,8 @@ from custom_components.sbfspot.const import (
     CONF_PASSWORD,
     CONF_PORT,
     DOMAIN,
+    MAX_MISSED_POLLS,
+    RETRY_DELAY,
 )
 from custom_components.sbfspot.smabt import (
     BridgeBusyError,
@@ -138,6 +140,25 @@ def sun_is_up() -> Generator[MagicMock]:
         yield mocked
 
 
+@pytest.fixture(autouse=True)
+def no_retry_pause() -> Generator[None]:
+    """Make the pause before the retry of a failed attempt (2 s) zero.
+
+    Most tests freeze the clock (``freezer``), and a frozen clock also freezes
+    ``loop.time()``: ``asyncio.sleep(2)`` would never end.  Tests of the pause
+    itself ask for ``retry_pause``.
+    """
+    with patch("custom_components.sbfspot.coordinator.RETRY_DELAY", 0.0):
+        yield
+
+
+@pytest.fixture
+def retry_pause(no_retry_pause: None) -> Generator[None]:
+    """The real pause before the retry; advance it with ``freezer.tick``."""
+    with patch("custom_components.sbfspot.coordinator.RETRY_DELAY", RETRY_DELAY):
+        yield
+
+
 @pytest.fixture
 def entity_registry_enabled_by_default() -> Generator[None]:
     """Enable every entity, including the ones that are disabled by default."""
@@ -209,3 +230,13 @@ async def refresh(hass: HomeAssistant, entry: MockConfigEntry) -> None:
     """Poll once, now (the coordinator's own timer is not involved)."""
     await entry.runtime_data.async_refresh()
     await hass.async_block_till_done()
+
+
+async def refresh_past_the_grace(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Poll until the grace after missed polls is used up.
+
+    A failed poll keeps the last online data for ``MAX_MISSED_POLLS`` polls in a
+    row.  After this call the next failed poll is the one that is reported.
+    """
+    for _ in range(MAX_MISSED_POLLS + 1):
+        await refresh(hass, entry)

@@ -30,6 +30,12 @@ async def async_get_config_entry_diagnostics(
     """Return diagnostics for a config entry."""
     coordinator = entry.runtime_data
     update_interval = coordinator.update_interval
+    # In memory only: the numbers start at 0 whenever the entry (re)loads.
+    poll_statistics = {
+        **coordinator.statistics.as_dict(),
+        "missed_polls_in_a_row": coordinator.missed_polls,
+        "poll_budget_seconds": coordinator.poll_budget,
+    }
     return async_redact_data(
         {
             "entry": {
@@ -44,6 +50,7 @@ async def async_get_config_entry_diagnostics(
                     update_interval.total_seconds() if update_interval else None
                 ),
                 "data": asdict(coordinator.data) if coordinator.data else None,
+                "poll_statistics": poll_statistics,
             },
         },
         TO_REDACT,
