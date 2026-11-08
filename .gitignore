@@ -220,6 +220,7 @@ __marimo__/
 
 # ESPHome build output and secrets
 esphome/.esphome/
+esphome/.gitignore
 esphome/secrets.yaml
 
 # Never commit SBFspot install files: its config holds the inverter password
